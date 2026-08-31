@@ -5,10 +5,11 @@ import sys
 import time
 import json
 import threading
-import queue
+import gc
 from datetime import datetime
 from flask import Flask, jsonify, request
 from flask_cors import CORS
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 app = Flask(__name__)
 CORS(app)
@@ -24,16 +25,15 @@ except ImportError as e:
     SOLVER_AVAILABLE = False
     print(f"❌ CN31 Solver not available: {e}")
 
-# Configuration
-BATCH_SIZE = 20
-TARGET_RATE = 20  # tokens per 3 seconds
-BATCH_INTERVAL = 3.0  # seconds
+# RAILWAY OPTIMIZED CONFIG
+BATCH_SIZE = 10
+MAX_WORKERS = 7  # Sweet spot for 10 tokens/3s
+BATCH_INTERVAL = 3.0
 
 solver_running = False
 solver_thread = None
 token_cache = []
 token_lock = threading.Lock()
-token_history = []
 stats = {
     "status": "idle",
     "tokens_generated": 0,
@@ -41,7 +41,7 @@ stats = {
     "tokens_per_second": 0,
     "start_time": None,
     "last_batch_time": None,
-    "threads": 10
+    "threads": MAX_WORKERS
 }
 
 TOKEN_FILE = "/app/validated_tokens.txt"
@@ -57,17 +57,13 @@ def read_tokens_from_file():
         return []
 
 def get_token_count():
-    """Get current token count"""
     with token_lock:
         return len(token_cache)
 
 def add_tokens_to_cache(tokens):
-    """Add tokens to cache"""
     with token_lock:
         token_cache.extend(tokens)
         stats["tokens_generated"] = len(token_cache)
-        
-        # Also write to file
         try:
             with open(TOKEN_FILE, 'a') as f:
                 for token in tokens:
@@ -76,7 +72,6 @@ def add_tokens_to_cache(tokens):
             pass
 
 def get_tokens_from_cache(n=1):
-    """Get tokens from cache"""
     with token_lock:
         if len(token_cache) >= n:
             result = token_cache[:n]
@@ -85,10 +80,9 @@ def get_tokens_from_cache(n=1):
         return []
 
 def run_solver_worker():
-    """Run solver in background with batch processing"""
     global solver_running, stats
     
-    print("🚀 Starting high-performance token generator...")
+    print("🚀 Starting 10 Tokens/3s Generator...")
     stats["status"] = "running"
     stats["start_time"] = datetime.now().isoformat()
     
@@ -98,19 +92,15 @@ def run_solver_worker():
     while solver_running:
         try:
             batch_start = time.time()
-            
-            # Check if we have enough tokens
             current_count = get_token_count()
             
-            if current_count < 50:  # Keep buffer of 50 tokens
-                # Generate batch of tokens
+            # Generate if we have less than 30 tokens buffer
+            if current_count < 30:
                 batch_tokens = []
                 
-                # Use multiple threads for parallel generation
-                with ThreadPoolExecutor(max_workers=stats["threads"]) as executor:
+                with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
                     futures = []
                     for i in range(BATCH_SIZE):
-                        # Use fresh config for each request
                         config = {
                             'ID_': ID,
                             'REFERER': REFERER,
@@ -121,9 +111,9 @@ def run_solver_worker():
                         future = executor.submit(run_single_token, i+1, config)
                         futures.append(future)
                     
-                    for future in as_completed(futures, timeout=10):
+                    for future in as_completed(futures, timeout=12):
                         try:
-                            token = future.result(timeout=5)
+                            token = future.result(timeout=6)
                             if token:
                                 batch_tokens.append(token)
                         except:
@@ -134,24 +124,26 @@ def run_solver_worker():
                     total_tokens += len(batch_tokens)
                     batch_count += 1
                     
-                    # Update stats
                     batch_time = time.time() - batch_start
                     stats["tokens_per_second"] = len(batch_tokens) / batch_time if batch_time > 0 else 0
                     stats["last_batch_time"] = datetime.now().isoformat()
                     
-                    print(f"Batch #{batch_count}: {len(batch_tokens)} tokens in {batch_time:.2f}s "
-                          f"| Total: {total_tokens} | Cache: {get_token_count()}")
+                    print(f"Batch #{batch_count}: {len(batch_tokens)} tokens | Total: {total_tokens} | Cache: {get_token_count()}")
                     
-                    # Sleep to maintain rate
+                    # GC every 5 batches
+                    if batch_count % 5 == 0:
+                        gc.collect()
+                    
+                    # Maintain 3s interval
                     if batch_time < BATCH_INTERVAL:
                         time.sleep(BATCH_INTERVAL - batch_time)
             else:
-                # Enough tokens, sleep
-                time.sleep(1)
+                # Enough tokens, sleep briefly
+                time.sleep(0.5)
                 
         except Exception as e:
             print(f"❌ Batch error: {e}")
-            time.sleep(1)
+            time.sleep(2)
     
     stats["status"] = "stopped"
 
@@ -174,8 +166,7 @@ def health():
         "ok": True,
         "solver_available": SOLVER_AVAILABLE,
         "status": stats["status"],
-        "tokens_available": get_token_count(),
-        "target_rate": f"{TARGET_RATE} tokens/3s"
+        "tokens_available": get_token_count()
     })
 
 @app.route('/start', methods=['POST'])
@@ -189,10 +180,9 @@ def start_solver():
         return jsonify({"error": "CN31 Solver not available"}), 500
     
     data = request.json or {}
-    threads = min(data.get("threads", 10), 20)  # Max 20 threads
+    threads = min(data.get("threads", MAX_WORKERS), 8)
     stats["threads"] = threads
     
-    # Initialize model
     model = initialize_global_model()
     if model is None:
         return jsonify({"error": "Failed to load model"}), 500
@@ -206,9 +196,8 @@ def start_solver():
     solver_thread.start()
     
     return jsonify({
-        "message": "Token generator started",
-        "threads": threads,
-        "target_rate": f"{TARGET_RATE} tokens/3s"
+        "message": "10 Tokens/3s generator started",
+        "threads": threads
     })
 
 @app.route('/stop', methods=['POST'])
@@ -226,7 +215,6 @@ def stop_solver():
 
 @app.route('/api/get-token', methods=['GET'])
 def get_token():
-    """Get single token"""
     tokens = get_tokens_from_cache(1)
     
     if tokens:
@@ -235,7 +223,7 @@ def get_token():
             "remaining": get_token_count()
         })
     
-    # Try to generate one immediately
+    # Generate one immediately
     try:
         config = {
             'ID_': ID,
@@ -258,9 +246,8 @@ def get_token():
 
 @app.route('/api/tokens', methods=['GET'])
 def get_tokens():
-    """Get multiple tokens"""
     n = request.args.get('n', 10, type=int)
-    n = min(n, 50)  # Max 50 per request
+    n = min(n, 50)
     
     tokens = get_tokens_from_cache(n)
     
@@ -271,12 +258,12 @@ def get_tokens():
             "remaining": get_token_count()
         })
     
-    # Try to generate some immediately
+    # Generate some immediately
     try:
         batch_tokens = []
-        with ThreadPoolExecutor(max_workers=min(n, 10)) as executor:
+        with ThreadPoolExecutor(max_workers=min(n, 7)) as executor:
             futures = []
-            for i in range(min(n, 10)):
+            for i in range(min(n, 7)):
                 config = {
                     'ID_': ID,
                     'REFERER': REFERER,
@@ -307,70 +294,6 @@ def get_tokens():
     
     return jsonify({"error": "No tokens available"}), 404
 
-@app.route('/api/batch', methods=['GET'])
-def get_batch():
-    """Get batch of tokens - optimized for high throughput"""
-    n = request.args.get('n', 20, type=int)
-    n = min(n, 50)
-    
-    tokens = get_tokens_from_cache(n)
-    
-    if len(tokens) >= n:
-        return jsonify({
-            "tokens": tokens,
-            "count": len(tokens),
-            "remaining": get_token_count(),
-            "fast": True
-        })
-    
-    # If not enough cache, generate more
-    needed = n - len(tokens)
-    try:
-        batch_tokens = []
-        with ThreadPoolExecutor(max_workers=min(needed, 10)) as executor:
-            futures = []
-            for i in range(min(needed, 10)):
-                config = {
-                    'ID_': ID,
-                    'REFERER': REFERER,
-                    'FP_H': FP_H,
-                    'UA': UserAgent().random,
-                    'DOMAIN': DUN163_DOMAINS[i % len(DUN163_DOMAINS)]
-                }
-                future = executor.submit(run_single_token, i+1, config)
-                futures.append(future)
-            
-            for future in as_completed(futures, timeout=10):
-                try:
-                    token = future.result(timeout=5)
-                    if token:
-                        batch_tokens.append(token)
-                except:
-                    continue
-        
-        if batch_tokens:
-            add_tokens_to_cache(batch_tokens)
-            # Get from cache again
-            additional = get_tokens_from_cache(batch_tokens)
-            all_tokens = tokens + additional
-            return jsonify({
-                "tokens": all_tokens,
-                "count": len(all_tokens),
-                "remaining": get_token_count(),
-                "fast": len(all_tokens) >= n
-            })
-    except:
-        pass
-    
-    if tokens:
-        return jsonify({
-            "tokens": tokens,
-            "count": len(tokens),
-            "remaining": get_token_count()
-        })
-    
-    return jsonify({"error": "No tokens available"}), 404
-
 @app.route('/api/stats')
 def api_stats():
     return jsonify({
@@ -378,20 +301,21 @@ def api_stats():
         "available": get_token_count(),
         "rate": stats["tokens_per_second"],
         "status": stats["status"],
-        "threads": stats["threads"],
-        "target": f"{TARGET_RATE} tokens/3s"
+        "threads": stats["threads"]
     })
 
 if __name__ == "__main__":
     port = int(os.environ.get('PORT', 6000))
     
     print(f"""
-🔐 CN31 Solver - High Performance
-─────────────────────────────────────────
-Port       : {port}
-Target Rate: {TARGET_RATE} tokens/3s
-Threads    : {stats['threads']}
-Solver     : {'✅ Available' if SOLVER_AVAILABLE else '❌ Not Available'}
+╔══════════════════════════════════════════════════════════════╗
+║  CN31 Solver - 10 Tokens/3s Mode                            ║
+╠══════════════════════════════════════════════════════════════╣
+║  Port       : {port}                                           ║
+║  Target     : 10 tokens per 3 seconds                        ║
+║  Threads    : {MAX_WORKERS}                                      ║
+║  Solver     : {'✅ Available' if SOLVER_AVAILABLE else '❌ Not Available'} ║
+╚══════════════════════════════════════════════════════════════╝
 """)
     
     app.run(host='0.0.0.0', port=port, debug=False, threaded=True)
