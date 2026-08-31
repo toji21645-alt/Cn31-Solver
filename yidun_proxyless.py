@@ -20,9 +20,9 @@ import torch
 import torch.nn as nn
 from collections import OrderedDict
 import queue
-import threading
 from functools import lru_cache
 from fake_useragent import UserAgent
+import gc
 
 warnings.filterwarnings("ignore", category=torch.serialization.SourceChangeWarning)
 warnings.filterwarnings("ignore", message=".*SIFT_create.*deprecated.*")
@@ -30,22 +30,58 @@ warnings.filterwarnings("ignore", message=".*SIFT_create.*deprecated.*")
 DEBUG = False
 
 DIR_PATH = os.path.dirname(os.path.abspath(__file__))
-USE_CUDA = True if torch.cuda.is_available() else False
-DEVICE = 'cuda' if USE_CUDA else 'cpu'
+USE_CUDA = False
+DEVICE = 'cpu'
 
-TOKEN_SERVER_URL = os.environ.get('TOKEN_SERVER_URL', 'https://cn31-web-atx-production.up.railway.app')
+TOKEN_SERVER_URL = os.environ.get('TOKEN_SERVER_URL', 'https://akamai-storage.onrender.com')
 TOKEN_SAVE_ENDPOINT = f"{TOKEN_SERVER_URL}/api/save-token"
 
-# Token queue for batch processing
+# Fast token queue
 token_queue = queue.Queue()
 token_lock = threading.Lock()
 token_counter = 0
 TOKEN_OUTPUT_FILE = os.path.join(DIR_PATH, 'validated_tokens.txt')
 
+# Connection pooling
+session_pool = []
+session_lock = threading.Lock()
+MAX_SESSIONS = 15
+
+def get_pooled_session():
+    """Get or create a pooled session for faster connections"""
+    with session_lock:
+        if session_pool:
+            return session_pool.pop()
+        else:
+            session = requests.Session()
+            session.headers.update({
+                "Accept": "*/*",
+                "Accept-Language": "*",
+                "Accept-Encoding": "gzip, deflate, br",
+                "Connection": "keep-alive",
+                "Cache-Control": "no-cache",
+                "Pragma": "no-cache"
+            })
+            # Configure connection pooling
+            adapter = requests.adapters.HTTPAdapter(
+                pool_connections=20,
+                pool_maxsize=20,
+                max_retries=2
+            )
+            session.mount('https://', adapter)
+            session.mount('http://', adapter)
+            return session
+
+def return_pooled_session(session):
+    """Return session to pool"""
+    with session_lock:
+        if len(session_pool) < MAX_SESSIONS:
+            session_pool.append(session)
+
 def send_token_to_server(token):
     try:
         payload = {"token": token}
-        r = requests.post(TOKEN_SAVE_ENDPOINT, json=payload, timeout=5)
+        r = requests.post(TOKEN_SAVE_ENDPOINT, json=payload, timeout=2)
         return r.status_code in [200, 201]
     except:
         return False
@@ -60,55 +96,33 @@ def save_token_locally(token):
         return False
 
 def add_token_to_queue(token):
-    """Add token to queue with thread safety"""
     global token_counter
     with token_lock:
         token_queue.put(token)
         token_counter += 1
-        
-        # Also save locally and try server
+        # Fast local save
         save_token_locally(token)
-        # Send to server in background (non-blocking)
+        # Async server send
         try:
             threading.Thread(target=send_token_to_server, args=(token,), daemon=True).start()
         except:
             pass
-        
-        logger.success(f"Token #{token_counter}: {token[:40]}...")
 
-def get_batch_tokens(batch_size=20):
-    """Get batch of tokens from queue"""
+def get_batch_tokens(batch_size=15):
     tokens = []
     try:
         for _ in range(batch_size):
-            token = token_queue.get(timeout=1.0)
+            token = token_queue.get(timeout=0.5)
             tokens.append(token)
     except queue.Empty:
         pass
     return tokens
 
 def get_token_count():
-    """Get current token count"""
     with token_lock:
         return token_counter
 
-if USE_CUDA:
-    torch.backends.cudnn.benchmark = True
-    torch.backends.cudnn.deterministic = False
-
-def emergency_fallback():
-    return [(80, 70), (160, 120), (240, 90)]
-
-def safe_list_access(lst, index, default=None):
-    try:
-        if lst is None or not isinstance(lst, (list, tuple)):
-            return default
-        if not (0 <= index < len(lst)):
-            return default
-        return lst[index]
-    except:
-        return default
-
+# Model - Fast loading with memory optimization
 _model_state = None
 _model_lock = threading.Lock()
 
@@ -124,16 +138,17 @@ def initialize_global_model():
             logger.error("Model file net.pkl not found")
             return None
         try:
-            state = torch.load(model_path, map_location=torch.device(DEVICE), weights_only=False)
+            state = torch.load(model_path, map_location=torch.device('cpu'), weights_only=False)
             if 'net' in state:
-                state['net'] = state['net'].to(DEVICE)
+                state['net'] = state['net'].to('cpu')
                 state['net'].eval()
-                if USE_CUDA:
-                    state['net'] = state['net'].half()
+                state['net'] = state['net'].half()
             _model_state = state
-            logger.success(f"Model loaded on {DEVICE}")
+            gc.collect()
+            logger.success("Model loaded on CPU")
             return _model_state
-        except:
+        except Exception as e:
+            logger.error(f"Model load error: {e}")
             return None
 
 def get_global_model():
@@ -142,7 +157,7 @@ def get_global_model():
         return initialize_global_model()
     return _model_state
 
-@lru_cache(maxsize=5)
+@lru_cache(maxsize=3)
 def get_compiled_js_cached(file_name):
     try:
         js_path = os.path.join(DIR_PATH, file_name)
@@ -165,12 +180,12 @@ def get_sift_detector():
         with _sift_lock:
             if _sift_detector is None:
                 try:
-                    _sift_detector = cv2.SIFT_create(nfeatures=50, contrastThreshold=0.08)
+                    _sift_detector = cv2.SIFT_create(nfeatures=20, contrastThreshold=0.12)
                 except AttributeError:
                     try:
-                        _sift_detector = cv2.xfeatures2d.SIFT_create(nfeatures=50, contrastThreshold=0.08)
+                        _sift_detector = cv2.xfeatures2d.SIFT_create(nfeatures=20, contrastThreshold=0.12)
                     except AttributeError:
-                        _sift_detector = cv2.ORB_create(nfeatures=50)
+                        _sift_detector = cv2.ORB_create(nfeatures=20)
     return _sift_detector
 
 REFERER = "https://mtacc.mobilelegends.com/"
@@ -181,6 +196,17 @@ DUN163_DOMAINS = [
     "https://c.dun.163.com",
     "https://c.dun.163yun.com"
 ]
+
+# Fast helper functions
+def safe_list_access(lst, index, default=None):
+    try:
+        if lst is None or not isinstance(lst, (list, tuple)):
+            return default
+        if not (0 <= index < len(lst)):
+            return default
+        return lst[index]
+    except:
+        return default
 
 def rotate_about_center(src, angle, scale=1.):
     try:
@@ -209,10 +235,7 @@ def parse_y_pred(ypred, anchors, class_types, islist=False, threshold=0.2, nms_t
                 tensor_idx = 4 + idx * ceillen
                 if tensor_idx >= ypred.shape[3]:
                     continue
-                if USE_CUDA:
-                    a = ypred[:,:,:,tensor_idx].cpu().detach().numpy()
-                else:
-                    a = ypred[:,:,:,tensor_idx].detach().numpy()
+                a = ypred[:,:,:,tensor_idx].cpu().detach().numpy()
                 for ii, i in enumerate(a[0]):
                     for jj, j in enumerate(i):
                         infos.append((ii, jj, idx, sigmoid(j)))
@@ -234,14 +257,9 @@ def parse_y_pred(ypred, anchors, class_types, islist=False, threshold=0.2, nms_t
                 pred_xy = torch.sigmoid(ypred[0, x, y, gp+0:gp+2])
                 pred_wh = ypred[0, x, y, gp+2:gp+4]
                 pred_clz = ypred[0, x, y, gp+5:gp+5+len(class_types)]
-                if USE_CUDA:
-                    pred_xy = pred_xy.cpu().detach().numpy()
-                    pred_wh = pred_wh.cpu().detach().numpy()
-                    pred_clz = pred_clz.cpu().detach().numpy()
-                else:
-                    pred_xy = pred_xy.detach().numpy()
-                    pred_wh = pred_wh.detach().numpy()
-                    pred_clz = pred_clz.detach().numpy()
+                pred_xy = pred_xy.cpu().detach().numpy()
+                pred_wh = pred_wh.cpu().detach().numpy()
+                pred_clz = pred_clz.cpu().detach().numpy()
                 exp = math.exp
                 cx, cy = float(pred_xy[0]), float(pred_xy[1])
                 rx, ry = (cx + x)*gap, (cy + y)*gap
@@ -252,10 +270,7 @@ def parse_y_pred(ypred, anchors, class_types, islist=False, threshold=0.2, nms_t
                 _x = rx + rw/2
                 yy = ry - rh/2
                 _y = ry + rh/2
-                if USE_CUDA:
-                    log_cons = torch.sigmoid(ypred[:,:,:,gp+4]).cpu().detach().numpy()
-                else:
-                    log_cons = torch.sigmoid(ypred[:,:,:,gp+4]).detach().numpy()
+                log_cons = torch.sigmoid(ypred[:,:,:,gp+4]).cpu().detach().numpy()
                 log_cons = np.transpose(log_cons, (0, 2, 1))
                 clz = 'unknown'
                 if clz_:
@@ -335,8 +350,7 @@ def get_clz_rect_from_image(image_data, state):
         npimg_ = np.transpose(npimg, (2,1,0))
         with torch.no_grad():
             input_tensor = torch.FloatTensor(npimg_).unsqueeze(0).to(DEVICE)
-            if USE_CUDA:
-                input_tensor = input_tensor.half()
+            input_tensor = input_tensor.half()
             y_pred = net(input_tensor)
         v = parse_y_pred(y_pred, anchors, class_types, islist=True, threshold=0.2, nms_threshold=0.4)
         ret = []
@@ -398,7 +412,7 @@ def get_flags_rects_from_image(image_data, state):
             try:
                 if i1.size == 0 or i2.size == 0:
                     return 0
-                i1 = cv2.resize(i1, (min(i1.shape[1]*4, 800), min(i1.shape[0]*4, 600)), interpolation=cv2.INTER_LINEAR)
+                i1 = cv2.resize(i1, (min(i1.shape[1]*3, 600), min(i1.shape[0]*3, 450)), interpolation=cv2.INTER_LINEAR)
                 i2 = cv2.resize(i2, (min(i2.shape[1]*2, 400), min(i2.shape[0]*2, 300)), interpolation=cv2.INTER_LINEAR)
                 sift = get_sift_detector()
                 kp1, des1 = sift.detectAndCompute(i1, None)
@@ -484,27 +498,20 @@ class Dun163:
         self.ctx = get_compiled_js('dun163.js')
 
     def set_session(self):
-        session = requests.Session()
+        session = get_pooled_session()
         domain_host = self.domain.replace('https://', '').replace('http://', '')
         session.headers.update({
-            "Accept": "*/*",
-            "Accept-Language": "*",
-            "Accept-Encoding": "*",
-            "Accept-Post": "*/*",
-            "Cache-Control": "no-cache",
-            "Connection": "keep-alive",
-            "Pragma": "no-cache",
             "Referer": self.request_params['referer'],
             "User-Agent": self.request_params['ua'],
             "Host": domain_host,
             "X-Forwarded-For": f"{random.randint(1, 255)}.{random.randint(1, 255)}.{random.randint(1, 255)}.{random.randint(1, 255)}",
             "X-Real-IP": f"{random.randint(1, 255)}.{random.randint(1, 255)}.{random.randint(1, 255)}.{random.randint(1, 255)}"
         })
-        session.timeout = (5, 10)
+        session.timeout = (3, 6)
         return session
 
     @staticmethod
-    @lru_cache(maxsize=1000)
+    @lru_cache(maxsize=500)
     def get_jsonp(text):
         try:
             jsonp_str = re.search(r"\((.*)\)", text, re.S)
@@ -513,12 +520,6 @@ class Dun163:
             return {}
         except:
             return {}
-
-    @staticmethod
-    def random_jsonp_str():
-        s = string.ascii_lowercase + string.digits
-        text = ''.join(random.choices(s, k=7))
-        return "__JSONP_" + text + '_'
 
     def request_getconf(self):
         try:
@@ -533,7 +534,7 @@ class Dun163:
                 "iv": "5",
                 "loadVersion": "2.5.3",
                 "lang": "en-US",
-                "callback": self.random_jsonp_str() + '0'
+                "callback": "__JSONP_" + ''.join(random.choices(string.ascii_lowercase + string.digits, k=7)) + '_0'
             }
             response = self.ss.get(url, params=params)
             response.raise_for_status()
@@ -574,7 +575,7 @@ class Dun163:
                 "sizeType": "10",
                 "smsVersion": "v3",
                 "token": "",
-                "callback": self.random_jsonp_str() + '0'
+                "callback": "__JSONP_" + ''.join(random.choices(string.ascii_lowercase + string.digits, k=7)) + '_0'
             }
             if ir_token:
                 params["irToken"] = ir_token
@@ -587,13 +588,11 @@ class Dun163:
     def request_check(self, dt, bid, *, token, captcha_type=7, click_data=None):
         try:
             url = self.domain + '/api/v3/check'
-            js_start_time = time.time()
             if captcha_type == 7 and click_data:
                 check_data = self.ctx.call('get_click_check_data', click_data, token)
             else:
                 check_data = '{"d":"","m":"","p":"","ext":""}'
             cb = self.ctx.call('get_cb')
-            js_time = time.time() - js_start_time
             params = {
                 "referer": self.request_params['referer'],
                 "zoneId": "CN31",
@@ -612,28 +611,24 @@ class Dun163:
                 "sdkVersion": "",
                 "loadVersion": "2.5.3",
                 "iv": "4",
-                "callback": self.random_jsonp_str() + '1'
+                "callback": "__JSONP_" + ''.join(random.choices(string.ascii_lowercase + string.digits, k=7)) + '_1'
             }
             resp = self.ss.get(url, params=params)
             resp_json = self.get_jsonp(resp.text)
-            return resp_json.get('data', {}), js_time
+            return resp_json.get('data', {}), 0.0
         except:
             return {}, 0.0
 
     def handle_click_captcha_hybrid(self, bg_url, token, attempt_num=0):
         try:
             headers = {"User-Agent": self.request_params['ua']}
-            resp = requests.get(bg_url, headers=headers, timeout=10)
+            resp = requests.get(bg_url, headers=headers, timeout=6)
             resp.raise_for_status()
             image_data = resp.content
-            img_start_time = time.time()
             state = get_global_model()
             if not state:
                 return self.generate_emergency_clicks(), 0.0
             rects = get_flags_rects_from_image(image_data, state)
-            img_time = time.time() - img_start_time
-            self._current_image_data = image_data
-            self._current_rects = rects
             rect1 = safe_list_access(rects, 0)
             rect2 = safe_list_access(rects, 1)
             rect3 = safe_list_access(rects, 2)
@@ -651,10 +646,10 @@ class Dun163:
                         click_points.append({"x": final_x, "y": final_y})
                 if len(click_points) >= 3:
                     self._current_click_points = click_points[:3]
-                    return click_points[:3], img_time
+                    return click_points[:3], 0.0
             click_points = self.generate_emergency_clicks()
             self._current_click_points = click_points
-            return click_points, img_time
+            return click_points, 0.0
         except Exception as e:
             return self.generate_emergency_clicks(), 0.0
 
@@ -678,9 +673,7 @@ class Dun163:
             return [{"x": 80, "y": 70}, {"x": 160, "y": 120}, {"x": 240, "y": 90}]
 
     def run_single(self, attempt_num=0):
-        """Single token generation - optimized for speed"""
         try:
-            # Get config
             get_conf_data = self.request_getconf()
             if not get_conf_data:
                 return None
@@ -708,8 +701,8 @@ class Dun163:
                 if not bg_urls:
                     return None
                 
-                click_points, img_time = self.handle_click_captcha_hybrid(bg_urls[0], token, attempt_num)
-                resp_json, js_time = self.request_check(dt, bid, token=token, captcha_type=7, click_data=click_points)
+                click_points, _ = self.handle_click_captcha_hybrid(bg_urls[0], token, attempt_num)
+                resp_json, _ = self.request_check(dt, bid, token=token, captcha_type=7, click_data=click_points)
             else:
                 return None
             
@@ -734,7 +727,6 @@ class Dun163:
             return None
 
 def run_single_token(thread_id, config):
-    """Run a single token generation with fresh session"""
     try:
         d = Dun163(
             id_=config['ID_'],
@@ -749,24 +741,20 @@ def run_single_token(thread_id, config):
         return None
 
 def main_batch():
-    """Batch token generation - optimized for speed"""
-    logger.info("Starting CN31 Solver - High Performance Mode")
+    logger.info("Starting CN31 Solver - 10 Tokens/3s Mode")
     
-    # Load model once
     model_state = initialize_global_model()
     if not model_state:
-        logger.error("Model not available - cannot continue")
+        logger.error("Model not available")
         return
     
-    # Load JS once
     js_ctx = get_compiled_js('dun163.js')
     if not js_ctx:
-        logger.error("JavaScript not available - cannot continue")
+        logger.error("JavaScript not available")
         return
     
-    logger.success("All resources loaded")
+    logger.success("Resources loaded")
     
-    # Configuration
     config = {
         'ID_': ID,
         'REFERER': REFERER,
@@ -775,12 +763,12 @@ def main_batch():
         'DOMAIN': DUN163_DOMAINS[0]
     }
     
-    # High performance settings
-    BATCH_SIZE = 20
-    NUM_WORKERS = 10  # 10 parallel workers
+    # OPTIMIZED: 7 workers for 10 tokens/3s
+    BATCH_SIZE = 10
+    NUM_WORKERS = 7
     
-    logger.info(f"Starting with {NUM_WORKERS} workers")
-    logger.info(f"Target: {BATCH_SIZE} tokens per batch")
+    logger.info(f"Workers: {NUM_WORKERS}, Batch: {BATCH_SIZE}")
+    logger.info(f"Target: 10 tokens per 3 seconds")
     logger.info("-" * 50)
     
     token_count = 0
@@ -791,7 +779,6 @@ def main_batch():
             batch_start = time.time()
             batch_tokens = []
             
-            # Generate tokens in parallel
             with ThreadPoolExecutor(max_workers=NUM_WORKERS) as executor:
                 futures = []
                 for i in range(BATCH_SIZE):
@@ -813,30 +800,31 @@ def main_batch():
             token_count += len(batch_tokens)
             batch_count += 1
             
-            # Add tokens to queue
             for token in batch_tokens:
                 add_token_to_queue(token)
             
-            # Log progress
             rate = len(batch_tokens) / batch_time if batch_time > 0 else 0
             logger.success(
                 f"Batch #{batch_count}: {len(batch_tokens)} tokens in {batch_time:.2f}s "
                 f"(~{rate:.1f} tokens/s) | Total: {token_count}"
             )
             
-            # Short delay between batches
-            if len(batch_tokens) < BATCH_SIZE * 0.5:
-                time.sleep(0.5)
+            # Garbage collection every 3 batches
+            if batch_count % 3 == 0:
+                gc.collect()
+            
+            # Wait to maintain 3s interval
+            if batch_time < 3.0:
+                time.sleep(3.0 - batch_time)
             
         except KeyboardInterrupt:
             logger.warning("Stopping...")
             break
         except Exception as e:
             logger.error(f"Batch error: {e}")
-            time.sleep(1)
+            time.sleep(2)
 
 def main():
-    """Main entry point - runs high performance mode"""
     main_batch()
 
 if __name__ == '__main__':
